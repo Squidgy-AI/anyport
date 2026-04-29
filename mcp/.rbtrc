@@ -1,0 +1,11 @@
+# Anyport MCP chat-app config.
+dev run --python
+dev run --application=main.py
+dev run --name=anyport_mcp
+dev run --no-generate-watch
+dev run --no-chaos
+
+serve run --python
+serve run --application=main.py
+serve run --name=anyport_mcp
+serve run --tls=external

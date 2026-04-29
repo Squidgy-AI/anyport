@@ -4,3 +4,12 @@ node_modules
 .env.local
 *.log
 .DS_Store
+
+# Local Python venvs
+venv/
+mcp/.venv/
+mcp/.rbt/
+__pycache__/
+
+# Proprietary avatar assets — do NOT commit (third-party brand IP)
+public/avatars/

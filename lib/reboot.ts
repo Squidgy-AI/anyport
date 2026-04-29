@@ -44,10 +44,11 @@ export async function deployMcpApp(input: RebootDeployInput): Promise<RebootDepl
     const data = await res.json();
     return { appId: data.app_id, installUrl: data.install_url };
   } catch (err) {
-    console.warn('[reboot] deploy failed, returning stub URL', err);
+    console.warn('[reboot] deploy failed, falling back to self-hosted chat', err);
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3040';
     return {
-      appId: `stub-${input.agentId}`,
-      installUrl: `https://claude.ai/install?app=${input.agentId}`,
+      appId: `local-${input.agentId}`,
+      installUrl: `${appUrl}/agent/${input.agentId}`,
     };
   }
 }

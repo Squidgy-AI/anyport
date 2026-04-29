@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 const SAMPLES = [
   {
@@ -15,13 +15,47 @@ const SAMPLES = [
   },
 ];
 
+const MODELS = [
+  { id: 'openai/gpt-4o-mini', label: 'GPT-4o mini — fast, cheap' },
+  { id: 'openai/gpt-5-mini', label: 'GPT-5 mini' },
+  { id: 'anthropic/claude-haiku-4.5', label: 'Claude Haiku 4.5' },
+  { id: 'anthropic/claude-sonnet-4.6', label: 'Claude Sonnet 4.6' },
+  { id: 'z-ai/glm-5.1', label: 'GLM-5.1' },
+];
+
 export default function Home() {
   const [name, setName] = useState('');
   const [prompt, setPrompt] = useState('');
+  const [model, setModel] = useState(MODELS[0].id);
   const [tools, setTools] = useState<Array<{ name: string; url: string }>>([]);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ installUrl: string; agentId: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [squidgyAgents, setSquidgyAgents] = useState<any[]>([]);
+  const [squidgyAgentId, setSquidgyAgentId] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch('/api/squidgy-agents')
+      .then((r) => r.json())
+      .then((d) => setSquidgyAgents(d.agents || []));
+  }, []);
+
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+
+  const importFromSquidgy = (id: string) => {
+    const a = squidgyAgents.find((x) => x.id === id);
+    if (!a) return;
+    setName(a.name);
+    setPrompt(a.systemPrompt);
+    setSquidgyAgentId(a.id);
+    setAvatarUrl(a.avatarUrl || null);
+    if (a.webhookUrl) {
+      setTools([{ name: `${a.id}_actions`, url: a.webhookUrl }]);
+    } else {
+      setTools([]);
+    }
+  };
 
   const loadSample = (s: typeof SAMPLES[0]) => {
     setName(s.name);
@@ -36,7 +70,7 @@ export default function Home() {
       const res = await fetch('/api/publish', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, systemPrompt: prompt, tools }),
+        body: JSON.stringify({ name, systemPrompt: prompt, tools, model, squidgyAgentId, avatarUrl }),
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
@@ -54,6 +88,30 @@ export default function Home() {
       <p style={{ opacity: 0.7, marginTop: 0, marginBottom: 32 }}>
         Publish any agent to Claude in 60 seconds. Billed by the token, automatically.
       </p>
+
+      {squidgyAgents.length > 0 && (
+        <div style={{
+          marginBottom: 24, padding: 16,
+          background: 'linear-gradient(135deg, #1a1530 0%, #15202a 100%)',
+          border: '1px solid #3a2a5c', borderRadius: 8,
+        }}>
+          <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+            Import from Squidgy · {squidgyAgents.length} agents in production
+          </div>
+          <select
+            onChange={(e) => importFromSquidgy(e.target.value)}
+            defaultValue=""
+            style={{ ...inputStyle, background: '#0e0e15' }}
+          >
+            <option value="" disabled>Pick an agent…</option>
+            {squidgyAgents.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.emoji} {a.name} — {a.description}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 24 }}>
         {SAMPLES.map((s) => (
@@ -96,6 +154,19 @@ export default function Home() {
         />
       </label>
 
+      <label style={{ display: 'block', marginBottom: 16 }}>
+        <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 6 }}>Model</div>
+        <select
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          style={inputStyle}
+        >
+          {MODELS.map((m) => (
+            <option key={m.id} value={m.id}>{m.label}</option>
+          ))}
+        </select>
+      </label>
+
       <ToolsEditor tools={tools} onChange={setTools} />
 
       <button
@@ -125,11 +196,26 @@ export default function Home() {
 
       {result && (
         <div style={{ marginTop: 24, padding: 20, background: '#15211a', borderRadius: 8, border: '1px solid #2a4a35' }}>
-          <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 8 }}>Live in Claude:</div>
-          <a href={result.installUrl} target="_blank" rel="noreferrer" style={{ color: '#7cffae', wordBreak: 'break-all' }}>
-            {result.installUrl}
-          </a>
-          <div style={{ marginTop: 16, fontSize: 13 }}>
+          <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 8 }}>Live install URL:</div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <a href={result.installUrl} target="_blank" rel="noreferrer" style={{ color: '#7cffae', wordBreak: 'break-all', flex: 1 }}>
+              {result.installUrl}
+            </a>
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(result.installUrl);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              }}
+              style={{ padding: '6px 12px', background: '#1c1c22', color: '#f5f5f7', border: '1px solid #2a2a32', borderRadius: 6, cursor: 'pointer', fontSize: 12 }}
+            >
+              {copied ? 'copied' : 'copy'}
+            </button>
+          </div>
+          <div style={{ marginTop: 16, display: 'flex', gap: 16, fontSize: 13 }}>
+            <a href={result.installUrl} target="_blank" rel="noreferrer" style={{ color: '#7c5cff' }}>
+              Open chat →
+            </a>
             <a href={`/dashboard?agent=${result.agentId}`} style={{ color: '#7c5cff' }}>
               View usage →
             </a>
