@@ -10,7 +10,7 @@
  * survive Anyport restart but are leaked; for hackathon scope that's fine.
  */
 import { spawn, ChildProcess } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, openSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { supabase } from '@/lib/supabase';
@@ -31,6 +31,8 @@ interface SpawnInput {
 interface SpawnResult {
   port: number;
   rbtPid: number;
+  tunnelUrl: string;
+  tunnelPid: number;
 }
 
 async function nextPort(): Promise<number> {
@@ -45,6 +47,30 @@ async function nextPort(): Promise<number> {
     .limit(1);
   const max = data?.[0]?.port ?? PORT_BASE;
   return max + 1;
+}
+
+async function tailForUrl(
+  path: string,
+  timeoutMs: number,
+  re: RegExp = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/,
+): Promise<string> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (existsSync(path)) {
+      const content = readFileSync(path, 'utf-8');
+      const m = content.match(re);
+      if (m) return m[1] || m[0];
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(`timed out waiting for tunnel URL in ${path}`);
+}
+
+async function killExisting(processName: string): Promise<void> {
+  return new Promise((resolve) => {
+    const k = spawn('pkill', ['-9', '-f', processName], { stdio: 'ignore' });
+    k.on('exit', () => setTimeout(resolve, 1000));
+  });
 }
 
 async function waitFor(re: RegExp, child: ChildProcess, timeoutMs: number): Promise<string> {
@@ -100,6 +126,7 @@ export async function spawnAgent(input: SpawnInput): Promise<SpawnResult> {
     `--env=AGENT_NAME=${input.agentName || input.agentId}`,
     `--env=ANYPORT_USAGE_URL=${input.anyportUsageUrl}`,
     ...(input.webhookUrl ? [`--env=WEBHOOK_URL=${input.webhookUrl}`] : []),
+    ...(process.env.DEMO_USER_ID ? [`--env=SQUIDGY_USER_ID=${process.env.DEMO_USER_ID}`] : []),
   ];
 
   // Use `script` to provide a TTY (rbt's chaos-monkey reader requires one).
@@ -112,8 +139,27 @@ export async function spawnAgent(input: SpawnInput): Promise<SpawnResult> {
   await waitFor(/Application is serving traffic/, rbt, 90_000);
   rbt.unref();
 
+  // ngrok handles routing. Free tier gives one static URL per account; we kill
+  // any prior ngrok and point the fresh one at this rbt's port. The install
+  // URL is therefore stable across publishes (only the agent behind it changes).
+  await killExisting('ngrok');
+  const tunnelLog = join(stateDir, 'ngrok.log');
+  const logFd = openSync(tunnelLog, 'a');
+  const tunnel = spawn('ngrok', ['http', `http://localhost:${port}`, '--log=stdout'], {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+  });
+  tunnel.unref();
+  const tunnelUrl = await tailForUrl(
+    tunnelLog,
+    30_000,
+    /url=(https:\/\/[a-z0-9-]+\.ngrok-free\.[a-z]+)/,
+  );
+
   return {
     port,
     rbtPid: rbt.pid!,
+    tunnelUrl,
+    tunnelPid: tunnel.pid!,
   };
 }
