@@ -1,6 +1,9 @@
 import { NextResponse } from 'next/server';
 import { nanoid } from 'nanoid';
 import { supabase } from '@/lib/supabase';
+import { endpoint as endpointImporter, mcp as mcpImporter } from '@/lib/importers';
+import { readSecret } from '@/lib/secrets';
+import type { EndpointConfig, McpConfig, ComposioMcpConfig } from '@/lib/types';
 
 const BASE = process.env.TOKENROUTER_BASE_URL || 'https://api.tokenrouter.com/v1';
 const ROOT_KEY = process.env.TOKENROUTER_API_KEY!;
@@ -98,7 +101,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
   const { data: agent, error: agentErr } = await supabase
     .from('anyport_agents')
-    .select('id, name, system_prompt, model, tokenrouter_key, tools')
+    .select('id, name, system_prompt, model, tokenrouter_key, tools, import_source, import_config')
     .eq('id', id)
     .single();
 
@@ -106,11 +109,74 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     return NextResponse.json({ error: 'agent not found' }, { status: 404 });
   }
 
+  // ---------- T1 — external endpoint passthrough ----------
+  // For external_endpoint agents, the endpoint IS the brain. We forward the
+  // last user message and return its response verbatim as the assistant turn.
+  // No TokenRouter inference; metering counts turns at $0 for now.
+  if (agent.import_source === 'external_endpoint') {
+    const config = agent.import_config as EndpointConfig | null;
+    if (!config || config.kind !== 'endpoint') {
+      return NextResponse.json({ error: 'invalid endpoint config' }, { status: 500 });
+    }
+    const lastUser = [...messages].reverse().find((m: any) => m.role === 'user');
+    if (!lastUser) return NextResponse.json({ content: '', toolEvents: [], usage: { promptTokens: 0, completionTokens: 0, cost: 0 } });
+
+    let secret: string | undefined;
+    if (config.auth.kind === 'bearer' || config.auth.kind === 'header') {
+      try {
+        secret = await readSecret(config.auth.secretId);
+      } catch (err: any) {
+        return NextResponse.json({ error: `secret unreadable: ${err?.message || String(err)}` }, { status: 500 });
+      }
+    }
+
+    const sessionId = `anyport_${id}_${nanoid(6)}`;
+    const result = await endpointImporter.invoke(config, String(lastUser.content || ''), secret, { sessionId });
+    if (result.ok === false) {
+      return NextResponse.json({ error: `endpoint: ${result.error}` }, { status: 502 });
+    }
+    // Per-turn metering at $0 (Phase 2: per-call markup).
+    await supabase.from('anyport_usage').insert({
+      agent_id: id,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      cost_usd: 0,
+    });
+    return NextResponse.json({
+      content: result.text,
+      toolEvents: [],
+      usage: { promptTokens: 0, completionTokens: 0, cost: 0 },
+    });
+  }
+  // --------------------------------------------------------
+
   const apiKey = agent.tokenrouter_key || ROOT_KEY;
   const model = agent.model || 'openai/gpt-4o-mini';
   const tools: AgentTool[] = Array.isArray(agent.tools) ? agent.tools : [];
-  const toolDefs = buildToolDefs(tools, agent.name);
   const sessionId = `anyport_${id}_${nanoid(6)}`;
+
+  // ---------- T2 — MCP-backed agent ----------
+  // For external_mcp / composio_mcp agents we expose the captured MCP tool
+  // schemas to the LLM, then dispatch tool_calls back through the MCP client.
+  const isMcpAgent = agent.import_source === 'external_mcp' || agent.import_source === 'composio_mcp';
+  let mcpAuthHeader: { name: string; value: string } | undefined;
+  if (isMcpAgent) {
+    const mcpCfg = agent.import_config as McpConfig | ComposioMcpConfig | null;
+    if (!mcpCfg) {
+      return NextResponse.json({ error: 'invalid mcp config' }, { status: 500 });
+    }
+    if (mcpCfg.kind === 'mcp' && mcpCfg.auth.kind === 'bearer') {
+      try {
+        mcpAuthHeader = { name: 'Authorization', value: `Bearer ${await readSecret(mcpCfg.auth.secretId)}` };
+      } catch (err: any) {
+        return NextResponse.json({ error: `mcp secret unreadable: ${err?.message || String(err)}` }, { status: 500 });
+      }
+    }
+  }
+
+  const toolDefs = isMcpAgent
+    ? mcpImporter.toOpenAITools(((agent.import_config as any)?.toolSchemas) || [])
+    : buildToolDefs(tools, agent.name);
 
   const systemAddon = toolDefs.length
     ? '\n\n---\nIMPORTANT TOOL-USE RULES:\n' +
@@ -185,19 +251,36 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       } catch {
         /* keep empty */
       }
-      const tool = tools.find((t) => t.name === toolName);
       let result: string;
-      if (tool && isSquidgyWebhook(tool.url)) {
-        result = await callSquidgyWebhook(
-          tool.url,
-          agent.name,
-          sessionId,
-          String(args.user_mssg || ''),
-        );
+
+      if (isMcpAgent && toolName?.startsWith('mcp__')) {
+        // T2 — dispatch back to the imported MCP server.
+        const mcpCfg = agent.import_config as McpConfig | ComposioMcpConfig;
+        const realName = toolName.slice('mcp__'.length);
+        const mcpResult = await mcpImporter.callTool({
+          url: mcpCfg.url,
+          authHeader: mcpAuthHeader,
+          toolName: realName,
+          args,
+        });
+        result = mcpResult.ok === true ? mcpResult.content : `(mcp error: ${mcpResult.error})`;
+        toolEvents.push({ name: toolName, input: JSON.stringify(args).slice(0, 200), output: result });
       } else {
-        result = `(unknown tool: ${toolName})`;
+        // Existing Squidgy-webhook path.
+        const tool = tools.find((t) => t.name === toolName);
+        if (tool && isSquidgyWebhook(tool.url)) {
+          result = await callSquidgyWebhook(
+            tool.url,
+            agent.name,
+            sessionId,
+            String(args.user_mssg || ''),
+          );
+        } else {
+          result = `(unknown tool: ${toolName})`;
+        }
+        toolEvents.push({ name: toolName, input: String(args.user_mssg || ''), output: result });
       }
-      toolEvents.push({ name: toolName, input: String(args.user_mssg || ''), output: result });
+
       convo.push({
         role: 'tool',
         tool_call_id: call.id,
