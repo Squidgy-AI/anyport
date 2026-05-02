@@ -12,6 +12,42 @@ interface Agent {
   requests: number;
   createdAt: string;
   lastUsedAt: string | null;
+  importSource: 'squidgy_yaml' | 'external_endpoint' | 'external_mcp' | 'composio_mcp' | 'a2a' | 'openai_sdk';
+  verificationStatus: 'pending' | 'verified' | 'unverified' | 'stale';
+}
+
+const SOURCE_META: Record<Agent['importSource'], { label: string; color: string; bg: string }> = {
+  squidgy_yaml: { label: 'Squidgy', color: '#5a2eff', bg: '#ede8ff' },
+  external_endpoint: { label: 'Endpoint', color: '#0a7a3f', bg: '#e2f5ea' },
+  external_mcp: { label: 'MCP', color: '#a13a3a', bg: '#f8e4e4' },
+  composio_mcp: { label: 'Composio', color: '#ad6800', bg: '#fff3d6' },
+  a2a: { label: 'A2A', color: '#5b5670', bg: '#eee9f3' },
+  openai_sdk: { label: 'OpenAI SDK', color: '#5b5670', bg: '#eee9f3' },
+};
+
+const VERIFY_META: Record<Agent['verificationStatus'], { icon: string; label: string; color: string }> = {
+  verified: { icon: '✓', label: 'Verified', color: '#0a7a3f' },
+  pending: { icon: '⏱', label: 'Pending', color: '#ad6800' },
+  unverified: { icon: '⚠', label: 'Unverified', color: '#a13a3a' },
+  stale: { icon: '⚠', label: 'Stale', color: '#a13a3a' },
+};
+
+function SourcePill({ source }: { source: Agent['importSource'] }) {
+  const m = SOURCE_META[source] || SOURCE_META.squidgy_yaml;
+  return (
+    <span style={{
+      display: 'inline-block', padding: '2px 8px', borderRadius: 999,
+      fontSize: 10, fontWeight: 600, letterSpacing: 0.5, textTransform: 'uppercase',
+      color: m.color, background: m.bg,
+    }}>{m.label}</span>
+  );
+}
+
+function VerifyBadge({ status }: { status: Agent['verificationStatus'] }) {
+  const m = VERIFY_META[status] || VERIFY_META.pending;
+  return (
+    <span title={m.label} style={{ color: m.color, fontWeight: 700, fontSize: 13 }}>{m.icon}</span>
+  );
 }
 
 function timeAgo(iso: string | null): string {
@@ -82,6 +118,7 @@ export default function Dashboard() {
           <thead>
             <tr style={{ textAlign: 'left', opacity: 0.6, fontSize: 12 }}>
               <th style={th}>NAME</th>
+              <th style={th}>SOURCE</th>
               <th style={th}>MODEL</th>
               <th style={th}>REQUESTS</th>
               <th style={th}>TOKENS</th>
@@ -93,13 +130,18 @@ export default function Dashboard() {
           <tbody>
             {agents.map((a) => (
               <tr key={a.id} style={{ borderTop: '1px solid #2a2a32' }}>
-                <td style={td}>{a.name}</td>
+                <td style={td}>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    {a.name}
+                    <VerifyBadge status={a.verificationStatus} />
+                  </span>
+                </td>
+                <td style={td}><SourcePill source={a.importSource} /></td>
                 <td style={{ ...td, fontSize: 12, opacity: 0.7 }}>{a.model || '—'}</td>
                 <td style={td}>{a.requests.toLocaleString()}</td>
                 <td style={td}>{a.tokens.toLocaleString()}</td>
                 <td style={td}>{formatCost(a.cost)}</td>
                 <td style={{ ...td, fontSize: 12, opacity: 0.7 }} suppressHydrationWarning>
-                  {/* now used to force re-render */}
                   <span data-now={now}>{timeAgo(a.lastUsedAt)}</span>
                 </td>
                 <td style={td}>

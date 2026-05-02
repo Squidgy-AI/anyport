@@ -83,12 +83,47 @@ export default function Home() {
   };
 
   return (
-    <main style={{ maxWidth: 720, margin: '0 auto', padding: '48px 24px' }}>
-      <h1 style={{ fontSize: 40, marginBottom: 8 }}>Anyport</h1>
+    <main style={{ maxWidth: 880, margin: '0 auto', padding: '48px 24px' }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 8 }}>
+        <h1 style={{ fontSize: 40, margin: 0 }}>Anyport</h1>
+        <a href="/dashboard" style={{ color: '#7c5cff', fontSize: 13, textDecoration: 'none' }}>
+          dashboard →
+        </a>
+      </div>
       <p style={{ opacity: 0.7, marginTop: 0, marginBottom: 32 }}>
-        Publish any agent to Claude in 60 seconds. Billed by the token, automatically.
+        Publish any agent — yours or imported — to a hosted, metered chat surface. Per-token billing, tools intact.
       </p>
 
+      <div style={{
+        marginBottom: 28,
+        display: 'grid',
+        gridTemplateColumns: 'repeat(3, 1fr)',
+        gap: 12,
+      }}>
+        <ImportCard
+          tag="01 · Squidgy"
+          title="Import from Squidgy"
+          desc={`Pick from ${squidgyAgents.length} production agents — system prompt + N8N tools auto-imported.`}
+          href="#squidgy-import"
+          accent="#7c5cff"
+        />
+        <ImportCard
+          tag="02 · Endpoint"
+          title="Bring your own endpoint"
+          desc="Wrap any HTTP chat endpoint as an Anyport agent. Probe → publish in <2 min."
+          href="/import/endpoint"
+          accent="#7cffae"
+        />
+        <ImportCard
+          tag="03 · MCP server"
+          title="Import an MCP server"
+          desc="Composio, Pipedream, or your own MCP — tools surface as callable agent abilities."
+          href="/import/mcp"
+          accent="#ffaa66"
+        />
+      </div>
+
+      <div id="squidgy-import" />
       {squidgyAgents.length > 0 && (
         <div style={{
           marginBottom: 24, padding: 16,
@@ -278,3 +313,37 @@ const inputStyle: React.CSSProperties = {
   fontSize: 14,
   boxSizing: 'border-box',
 };
+
+function ImportCard({
+  tag, title, desc, href, accent,
+}: { tag: string; title: string; desc: string; href: string; accent: string }) {
+  return (
+    <a
+      href={href}
+      style={{
+        display: 'block',
+        padding: 16,
+        background: '#15151b',
+        border: '1px solid #2a2a32',
+        borderRadius: 10,
+        textDecoration: 'none',
+        color: '#f5f5f7',
+        transition: 'border-color 0.15s ease, transform 0.15s ease',
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.borderColor = accent;
+        e.currentTarget.style.transform = 'translateY(-2px)';
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.borderColor = '#2a2a32';
+        e.currentTarget.style.transform = 'translateY(0)';
+      }}
+    >
+      <div style={{ fontSize: 11, fontFamily: 'ui-monospace, monospace', color: accent, letterSpacing: 0.5, marginBottom: 8 }}>
+        {tag}
+      </div>
+      <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 6, letterSpacing: '-0.01em' }}>{title}</div>
+      <div style={{ fontSize: 12, opacity: 0.65, lineHeight: 1.45 }}>{desc}</div>
+    </a>
+  );
+}
