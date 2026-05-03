@@ -32,12 +32,19 @@ export interface IntrospectResult {
 const INTROSPECT_TIMEOUT_MS = 20_000;
 
 function makeTransport(input: IntrospectInput) {
-  const opts: any = {};
-  if (input.authHeader) {
-    opts.requestInit = {
-      headers: { [input.authHeader.name]: input.authHeader.value },
-    };
+  const headers: Record<string, string> = {};
+
+  // Auto-inject Composio API key when talking to a Composio MCP URL.
+  // Composio tightened auth — user_id query alone no longer authenticates;
+  // every request also needs `X-API-Key`.
+  if (parseComposioUrl(input.url) && process.env.COMPOSIO_API_KEY && !input.authHeader) {
+    headers['X-API-Key'] = process.env.COMPOSIO_API_KEY;
   }
+  if (input.authHeader) {
+    headers[input.authHeader.name] = input.authHeader.value;
+  }
+
+  const opts: any = Object.keys(headers).length ? { requestInit: { headers } } : {};
   return new StreamableHTTPClientTransport(new URL(input.url), opts);
 }
 

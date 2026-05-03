@@ -24,21 +24,47 @@ Each is a 5–30 min check. None require building anything new.
 
 ---
 
+## ⚠️ Run from a real terminal — not Claude Code's Bash sub-shell
+
+The Bash sub-shell on Seth's mac has IPv6 default routes captured by phantom utun*
+VPN interfaces, so all subsequent fetches to Cloudflare-fronted hosts time out
+after the initial request (see workspace memory `reference_supabase_credentials.md`).
+This affects both the dev server's `/api/import/probe-mcp` route AND the standalone
+spike script when launched from Claude. **Open a normal Terminal window and run
+the steps below from there.**
+
+Verified 2026-05-03 from Claude's Bash sub-shell:
+- `c.connect(t)` succeeded (initialize POST went through)
+- `c.listTools()` failed: `fetch failed` → `ETIMEDOUT 104.18.20.5:443` + `EHOSTUNREACH 2606:4700::6812:1405:443`
+
+The same code is expected to work from Seth's terminal.
+
 ## 60-minute checklist
 
 ### 1 · Composio Slack URL ready (0 min, prereq)
 Confirm you have the Composio MCP URL with Slack already wired (per memory, this exists). Form: `https://mcp.composio.dev/v3/mcp/<server_id>/mcp?user_id=<uid>`.
 
 ### 2 · Introspect (5 min) — risk 1 + 2
+
+**From a real terminal:**
 ```bash
 cd /Users/sethward/GIT/Hackathons/anyport
+node scripts/spike-mcp.mjs
+```
+Or via the dev server (also from a real terminal):
+```bash
 npm run dev   # starts on :3040
 curl -sS -X POST http://localhost:3040/api/import/probe-mcp \
   -H 'Content-Type: application/json' \
   -d '{"url":"<composio_slack_mcp_url>"}' | jq
 ```
-**Pass:** `ok:true` and a non-empty `tools[]` with at least one Slack tool (e.g. `SLACK_SEND_MESSAGE` or similar).
-**Fail to investigate:** transport error → SDK not compatible with Composio's HTTP server. Empty tools → URL or user_id wrong.
+**Pass:** non-empty tools list with Slack actions (`SLACK_SEND_MESSAGE`, etc).
+**Fail to investigate:** transport error → SDK not compatible with Composio's HTTP server. Empty tools → URL/user_id wrong, or Composio connection went stale.
+
+**Composio API key is auto-injected** as `X-API-Key` when the URL is recognised
+as Composio. Set `COMPOSIO_API_KEY` in `.env.local`. As of mid-2026 Composio
+requires this header even for user-scoped URLs (regression from the 2026-04-15
+behaviour captured in `project_composio.md`).
 
 ### 3 · Inspect schema (5 min) — risk 2
 From the probe response, eyeball the `inputSchema` of one tool. Look for:
