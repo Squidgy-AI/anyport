@@ -3,16 +3,26 @@
 // We CONSUME MCP servers (Composio, anyone's MCP HTTP server). For each
 // imported server we capture its tool list at import time, then at chat time
 // the LLM (via TokenRouter) sees those tools as OpenAI-compatible function
-// descriptors, and tool calls are dispatched back through the MCP client.
+// descriptors, and tool calls are dispatched back through this client.
+//
+// Implementation note (2026-05-03): the @modelcontextprotocol/sdk TS client
+// proved unreliable under Node 18+ undici-fetch in our Next.js route handlers
+// (intermittent ETIMEDOUT to Cloudflare). We hand-roll the JSON-RPC over
+// Streamable-HTTP transport directly. Same protocol, fewer surprises.
+//
+// Streamable HTTP per MCP spec:
+//   POST <url>  body: {jsonrpc: '2.0', id, method, params}
+//   Headers: Content-Type: application/json, Accept: application/json, text/event-stream
+//   Server may return text/event-stream (data: <json>\n) or application/json.
+//   May return Mcp-Session-Id; if so, send it back on subsequent requests.
+//
+// Verified against Composio's MCP server end-to-end on 2026-05-03.
 
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { McpConfig, ComposioMcpConfig } from '../types';
 
 export interface IntrospectInput {
   url: string;
   authHeader?: { name: string; value: string };
-  // Composio URLs already have user_id as a query param; nothing extra needed.
 }
 
 export interface IntrospectedTool {
@@ -29,44 +39,67 @@ export interface IntrospectResult {
   serverVersion?: string;
 }
 
-const INTROSPECT_TIMEOUT_MS = 20_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 
-function makeTransport(input: IntrospectInput) {
-  const headers: Record<string, string> = {};
+function buildHeaders(input: IntrospectInput, sessionId?: string | null): HeadersInit {
+  const h: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/event-stream',
+  };
 
   // Auto-inject Composio API key when talking to a Composio MCP URL.
-  // Composio tightened auth — user_id query alone no longer authenticates;
-  // every request also needs `X-API-Key`.
+  // Composio tightened auth in mid-2026 — user_id query alone is insufficient.
   if (parseComposioUrl(input.url) && process.env.COMPOSIO_API_KEY && !input.authHeader) {
-    headers['X-API-Key'] = process.env.COMPOSIO_API_KEY;
+    h['X-API-Key'] = process.env.COMPOSIO_API_KEY;
   }
-  if (input.authHeader) {
-    headers[input.authHeader.name] = input.authHeader.value;
-  }
+  if (input.authHeader) h[input.authHeader.name] = input.authHeader.value;
+  if (sessionId) h['Mcp-Session-Id'] = sessionId;
 
-  const opts: any = Object.keys(headers).length ? { requestInit: { headers } } : {};
-  return new StreamableHTTPClientTransport(new URL(input.url), opts);
+  return h;
 }
 
-async function withClient<T>(input: IntrospectInput, fn: (c: Client) => Promise<T>): Promise<T> {
-  const transport = makeTransport(input);
-  const client = new Client(
-    { name: 'anyport', version: '0.1.0' },
-    { capabilities: {} },
-  );
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), INTROSPECT_TIMEOUT_MS);
-  try {
-    await client.connect(transport);
-    return await fn(client);
-  } finally {
-    clearTimeout(timer);
-    try {
-      await client.close();
-    } catch {
-      /* ignore */
-    }
+async function rpc(
+  input: IntrospectInput,
+  rpcId: number,
+  method: string,
+  params: unknown,
+  sessionId?: string | null,
+): Promise<{ result: unknown; sessionId: string | null }> {
+  const body = JSON.stringify({ jsonrpc: '2.0', id: rpcId, method, params });
+  const ctrl = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+
+  const res = await fetch(input.url, {
+    method: 'POST',
+    headers: buildHeaders(input, sessionId),
+    body,
+    signal: ctrl,
+  });
+
+  const newSessionId = res.headers.get('mcp-session-id') || sessionId || null;
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`mcp ${method} returned ${res.status}: ${text.slice(0, 300)}`);
   }
+
+  const ct = res.headers.get('content-type') || '';
+  let frame: any;
+  if (ct.includes('text/event-stream')) {
+    const text = await res.text();
+    let dataLine: string | null = null;
+    for (const line of text.split('\n')) {
+      if (line.startsWith('data:')) { dataLine = line.slice(5).trim(); break; }
+    }
+    if (!dataLine) throw new Error(`mcp ${method}: no data: line in SSE response`);
+    frame = JSON.parse(dataLine);
+  } else {
+    frame = await res.json();
+  }
+
+  if (frame.error) {
+    throw new Error(`mcp ${method} rpc error: ${JSON.stringify(frame.error).slice(0, 300)}`);
+  }
+  return { result: frame.result, sessionId: newSessionId };
 }
 
 export async function introspect(input: IntrospectInput): Promise<IntrospectResult> {
@@ -76,22 +109,29 @@ export async function introspect(input: IntrospectInput): Promise<IntrospectResu
   }
 
   try {
-    return await withClient(input, async (client) => {
-      const info = client.getServerVersion();
-      const list = await client.listTools();
-      const tools: IntrospectedTool[] = (list.tools || []).map((t: any) => ({
-        name: t.name,
-        description: t.description,
-        inputSchema: t.inputSchema,
-      }));
-      return {
-        ok: true,
-        message: `connected · ${tools.length} tool(s) discovered`,
-        tools,
-        serverName: info?.name,
-        serverVersion: info?.version,
-      };
+    let sessionId: string | null = null;
+    const init = await rpc(input, 1, 'initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'anyport', version: '0.1.0' },
     });
+    sessionId = init.sessionId;
+    const initResult = init.result as any;
+
+    const list = await rpc(input, 2, 'tools/list', {}, sessionId);
+    const tools: IntrospectedTool[] = ((list.result as any)?.tools || []).map((t: any) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema,
+    }));
+
+    return {
+      ok: true,
+      message: `connected · ${tools.length} tool(s) discovered`,
+      tools,
+      serverName: initResult?.serverInfo?.name,
+      serverVersion: initResult?.serverInfo?.version,
+    };
   } catch (err: any) {
     return { ok: false, message: `mcp introspect failed: ${err?.message || String(err)}` };
   }
@@ -104,27 +144,41 @@ export interface CallToolInput {
   args: Record<string, unknown>;
 }
 
-export async function callTool(input: CallToolInput): Promise<{ ok: true; content: string } | { ok: false; error: string }> {
+export async function callTool(
+  input: CallToolInput,
+): Promise<{ ok: true; content: string } | { ok: false; error: string }> {
   try {
-    return await withClient(input, async (client) => {
-      const result = await client.callTool({ name: input.toolName, arguments: input.args });
-      // MCP returns content as an array of typed parts. Flatten text parts to a single string.
-      const parts = (result.content as any[]) || [];
-      const text = parts
-        .map((p: any) => {
-          if (typeof p === 'string') return p;
-          if (p && p.type === 'text' && typeof p.text === 'string') return p.text;
-          if (p && p.type === 'image') return `[image:${p.mimeType || 'unknown'}]`;
-          if (p && p.type === 'resource' && p.resource?.text) return p.resource.text;
-          return '';
-        })
-        .join('')
-        .trim();
-      if (result.isError) {
-        return { ok: false as const, error: text || 'tool call returned error' };
-      }
-      return { ok: true as const, content: text || '(empty result)' };
+    // initialize → tools/call. Re-initialize per call: stateless, simpler than
+    // managing session lifetimes across long-lived chat sessions.
+    let sessionId: string | null = null;
+    const init = await rpc(input, 1, 'initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'anyport', version: '0.1.0' },
     });
+    sessionId = init.sessionId;
+
+    const call = await rpc(
+      input,
+      2,
+      'tools/call',
+      { name: input.toolName, arguments: input.args },
+      sessionId,
+    );
+    const r = call.result as any;
+    const parts = (r?.content as any[]) || [];
+    const text = parts
+      .map((p: any) => {
+        if (typeof p === 'string') return p;
+        if (p && p.type === 'text' && typeof p.text === 'string') return p.text;
+        if (p && p.type === 'image') return `[image:${p.mimeType || 'unknown'}]`;
+        if (p && p.type === 'resource' && p.resource?.text) return p.resource.text;
+        return '';
+      })
+      .join('')
+      .trim();
+    if (r?.isError) return { ok: false, error: text || 'tool call returned error' };
+    return { ok: true, content: text || '(empty result)' };
   } catch (err: any) {
     return { ok: false, error: `mcp call failed: ${err?.message || String(err)}` };
   }
@@ -132,27 +186,35 @@ export async function callTool(input: CallToolInput): Promise<{ ok: true; conten
 
 // Convert MCP tool schemas to OpenAI-compatible function descriptors.
 // TokenRouter accepts the OpenAI tools schema; this is the bridge.
+// Strip $schema (OpenAI rejects extra top-level keys in JSON Schema).
 export function toOpenAITools(
   tools: IntrospectedTool[],
-  // the LLM sees a name; we prefix with mcp__ so the chat dispatcher can route correctly
   prefix = 'mcp__',
 ): Array<{
   type: 'function';
   function: { name: string; description?: string; parameters: any };
 }> {
-  return tools.map((t) => ({
-    type: 'function',
-    function: {
-      name: `${prefix}${t.name}`,
-      description: t.description || `Call MCP tool ${t.name}`,
-      parameters: (t.inputSchema as any) || { type: 'object', properties: {} },
-    },
-  }));
+  return tools.map((t) => {
+    const schema = (t.inputSchema as any) || { type: 'object', properties: {} };
+    // Drop draft-07 marker — OpenAI's validator ignores or rejects unknown top-level keys.
+    const { $schema, ...rest } = schema;
+    return {
+      type: 'function',
+      function: {
+        name: `${prefix}${t.name}`,
+        description: t.description || `Call MCP tool ${t.name}`,
+        parameters: rest,
+      },
+    };
+  });
 }
 
-// Composio MCP URL pattern: https://mcp.composio.dev/v3/mcp/<server_id>/mcp?user_id=<uid>
+// Composio MCP URL pattern: https://backend.composio.dev/v3/mcp/<server_id>/mcp?...&user_id=<uid>
+// (Also matches mcp.composio.dev for legacy/alt domains.)
 // Returns null for non-Composio URLs.
-export function parseComposioUrl(url: string): { composioServerId: string; composioUserId: string } | null {
+export function parseComposioUrl(
+  url: string,
+): { composioServerId: string; composioUserId: string } | null {
   try {
     const u = new URL(url);
     if (!u.hostname.endsWith('composio.dev')) return null;
